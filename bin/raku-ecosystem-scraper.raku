@@ -9,11 +9,9 @@ constant $VALKEY-HOST = '172.19.2.254'; # valkey-vip.rse.local
 constant $VALKEY-PORT = 6379;
 
 #| Naming Conventions (Environmental Infrastructure)
-#  We use 'RSE^' as the delimiter for infrastructure keys.
-#  Format: RSE^<Category>^<SubCat>^<Entity>^<ID>
-constant $KEY-INDEX       = 'RSE^Raku^zef^index';          # Set of all known module names
-constant $KEY-MOD-PREFIX  = 'RSE^Raku^zef^modules^';       # Prefix for module data keys
-constant $KEY-BUILD-ORDER = 'RSE^Raku^zef^build-order';    # List of final sorted build order
+constant $KEY-INDEX       = 'RSE^Raku^zef^index';          
+constant $KEY-MOD-PREFIX  = 'RSE^Raku^zef^modules^';       
+constant $KEY-BUILD-ORDER = 'RSE^Raku^zef^build-order';    
 
 sub MAIN() {
     say "Connecting to Valkey ($VALKEY-HOST:$VALKEY-PORT)...";
@@ -87,31 +85,29 @@ sub load-valkey-state($redis) {
     my %db;
     
     # 1. Get all known module names from the RSE Index
-    my @keys = $redis.smembers($KEY-INDEX);
+    # FIX: Explicitly decode Buf -> Str
+    my @keys = $redis.smembers($KEY-INDEX).map({ $_ ~~ Buf ?? $_.decode('utf-8') !! $_ });
+    
     return %() unless @keys;
 
     # 2. Construct full keys
+    # Now safe because @keys are guaranteed Str
     my @redis-keys = @keys.map: { $KEY-MOD-PREFIX ~ $_ };
     
     # 3. MGET (Multi-Get)
-    my @json-blobs = $redis.mget(@redis-keys);
+    # FIX: Decode the JSON blobs returned by MGET
+    my @json-blobs = $redis.mget(@redis-keys).map({ $_ ~~ Buf ?? $_.decode('utf-8') !! $_ });
 
-    # 4. Reconstruct Hash with Strict Checks
+    # 4. Reconstruct Hash
     for @keys Z @json-blobs -> ($name, $json) {
-        # Guard: Check if $json is defined, is a String, and has content (e.g. "{...}")
+        # Check if $json is valid (defined, is Str, not empty)
         if $json.defined && $json ~~ Str && $json.chars > 1 {
             try {
                 %db{$name} = from-json($json);
                 CATCH { 
-                    default {
-                        note "Warning: Corrupt/Invalid JSON for module '$name'. Skipping.";
-                    }
+                    default { note "Warning: Corrupt/Invalid JSON for module '$name'. Skipping."; }
                 }
             }
-        }
-        else {
-            # Silent skip for empty/nil entries to clean up the index logically
-            # Optional: $redis.srem($KEY-INDEX, $name) if you wanted to auto-clean
         }
     }
     return %db;
@@ -121,7 +117,7 @@ sub save-module-to-valkey($redis, $name, %data) {
     # 1. Add name to Index Set (Idempotent)
     $redis.sadd($KEY-INDEX, $name);
     
-    # 2. Store Metadata as JSON using the RSE^ prefix
+    # 2. Store Metadata as JSON
     my $key = $KEY-MOD-PREFIX ~ $name;
     $redis.set($key, to-json(%data));
 }
@@ -173,14 +169,12 @@ sub fetch-latest-candidates() {
         say "  - Querying $repo...";
         my $proc = run 'zef', 'list', $repo, :out, :err;
         for $proc.out.lines -> $line {
-            # Regex captures latest version and auth
             if $line ~~ /^ (\S+) \:ver\< (.*?) \> [ \:auth\< (.*?) \> ]? / {
                 my $name = ~$0;
                 my $ver-str = ~$1;
                 my $auth = $2 // '';
                 my $ver = Version.new($ver-str);
                 
-                # Logic: Keep only the highest version
                 if %modules{$name}:!exists || $ver > %modules{$name}<ver> {
                     %modules{$name} = { name => $name, ver => $ver, auth => ~$auth };
                 }
