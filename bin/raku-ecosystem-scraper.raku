@@ -1,7 +1,5 @@
 #!/var/lib/data/raku/maxzef/bin/raku
 
-#!/usr/bin/env raku
-
 use v6.d;
 use JSON::Fast;
 use Redis;
@@ -35,14 +33,12 @@ sub MAIN() {
     my $r-handle = RedisHandle.new(host => $VALKEY-HOST, port => $VALKEY-PORT);
     $r-handle.connect();
 
-    # 1. Fetch Fresh 'Universe' from Zef Repos
-    #    Since we cleaned the DB, we treat everything found as "New".
-    say "Fetching fresh module list from zef (fez, cpan, rea)...";
+    # 1. Fetch Fresh 'Universe' with Strict Priorities
+    say "Fetching fresh module list (Priority: Fez > CPAN > Rea)...";
     my %live-candidates = fetch-latest-candidates();
-    say "Found { %live-candidates.elems } unique modules in ecosystem.";
+    say "Found { %live-candidates.elems } unique winning candidates.";
 
-    # 2. Process Queue (The Heavy Lifting)
-    #    We process ALL modules because we are starting from scratch.
+    # 2. Process Queue (Deep Dependency Scan)
     say "Beginning Deep Dependency Scan (Runtime + Build + Test)...";
     
     my @queue = %live-candidates.values.sort(*<name>);
@@ -55,13 +51,27 @@ sub MAIN() {
 
     # 3. Topological Sort
     say "Starting Topological Sort (Build Order Calculation)...";
-    my @sorted-list = topological-sort(%final-dataset);
+    my @sorted-names = topological-sort(%final-dataset);
     
-    say "Top 5 Install Candidates (No Deps): { @sorted-list[0..4].join(', ') }";
+    # 4. Convert Names to Pinned Identities
+    #    We map the sorted names back to their specific versions/auths
+    #    so the Builder installs EXACTLY what the Scraper chose.
+    my @build-list;
+    for @sorted-names -> $name {
+        if %final-dataset{$name} -> $info {
+            # Reconstruct identity: "Name:ver<...>:auth<...>"
+            my $id = $name;
+            if $info<ver>  { $id ~= ":ver<$info<ver>>" }
+            if $info<auth> { $id ~= ":auth<$info<auth>>" }
+            @build-list.push($id);
+        }
+    }
 
-    # 4. Publish Final List
-    say "Publishing build order to Valkey list: $KEY-BUILD-ORDER";
-    update-build-order($r-handle, @sorted-list);
+    say "Top 5 Install Candidates: { @build-list[0..4].join(', ') }";
+
+    # 5. Publish Final List
+    say "Publishing pinned build order to Valkey list: $KEY-BUILD-ORDER";
+    update-build-order($r-handle, @build-list);
     
     say "Done.";
     try { $r-handle.client.quit; }
@@ -80,13 +90,12 @@ sub process-queue(@queue, %current-set, $r-handle) {
         my $name = $candidate<name>;
         
         # Identity needed for 'zef info' to be precise
-        # e.g. "JSON::Fast:ver<0.19>:auth<zef:timo>"
         my $identity = "$name";
         if $candidate<ver>  { $identity ~= ":ver<$candidate<ver>>" }
         if $candidate<auth> { $identity ~= ":auth<$candidate<auth>>" }
 
-        # Progress logging
-        say "[$count/$total] Scanning: $name" if $count %% 10; # Reduce log noise slightly
+        # Log progress every 50 items
+        say "[$count/$total] Scanning: $name" if $count %% 50;
 
         # DEEP SCAN: Get Depends, Build-depends, Test-depends
         my @deps = get-deep-dependencies($identity);
@@ -94,13 +103,14 @@ sub process-queue(@queue, %current-set, $r-handle) {
         my $record = {
             ver  => $candidate<ver>.Str,
             auth => $candidate<auth>,
+            repo => $candidate<repo>,
             deps => @deps
         };
 
         # 1. Update Memory
         %current-set{$name} = $record;
 
-        # 2. Persist to Valkey (Robustly)
+        # 2. Persist to Valkey
         save-module-robust($r-handle, $name, $record);
     }
 }
@@ -112,17 +122,13 @@ sub save-module-robust($r-handle, $name, %data) {
     while $attempt < $max-retries {
         try {
             $r-handle.ensure-connection();
-            
-            # Atomic Pipeline preferred, but separate commands are fine for this
             $r-handle.client.sadd($KEY-INDEX, $name);
             $r-handle.client.set($KEY-MOD-PREFIX ~ $name, to-json(%data));
-            
-            return; # Success
+            return; 
         }
         CATCH {
             default {
                 $attempt++;
-                # Only log if it's a real retry, not just a blip
                 if $attempt > 1 {
                     note "    ! Connection issue saving $name. Retry $attempt...";
                 }
@@ -136,14 +142,17 @@ sub save-module-robust($r-handle, $name, %data) {
 }
 
 # ==========================================
-# ZEF INTERACTION
+# ZEF INTERACTION & PRIORITY LOGIC
 # ==========================================
 
 sub fetch-latest-candidates() {
+    # PRIORITY ORDER: fez (First) > cpan > rea (Last)
+    # The loop processes them in this order.
+    # We only update an entry if the new version is STRICTLY GREATER (>).
+    # Therefore, if Versions are EQUAL, the first one seen (Fez) wins.
     my @repos = <fez cpan rea>;
     my %modules; 
 
-    # We run 'zef list' to populate the local cache and get available versions
     for @repos -> $repo {
         say "  - Querying $repo...";
         my $proc = run 'zef', 'list', $repo, :out, :err;
@@ -156,9 +165,17 @@ sub fetch-latest-candidates() {
                 my $auth = $2 // '';
                 my $ver = Version.new($ver-str);
                 
-                # Keep highest version
+                # SELECTION LOGIC:
+                # 1. New Module? Take it.
+                # 2. Higher Version? Take it (Most recent date wins).
+                # 3. Equal Version? KEEP EXISTING (Because Fez was processed first).
                 if %modules{$name}:!exists || $ver > %modules{$name}<ver> {
-                    %modules{$name} = { name => $name, ver => $ver, auth => ~$auth };
+                    %modules{$name} = { 
+                        name => $name, 
+                        ver  => $ver, 
+                        auth => ~$auth,
+                        repo => $repo
+                    };
                 }
             }
         }
@@ -167,29 +184,16 @@ sub fetch-latest-candidates() {
 }
 
 sub get-deep-dependencies($identity) {
-    # We use 'zef info' to get the raw meta-data requirements.
-    # This includes Build and Test requirements which are critical for
-    # a clean "from scratch" build order.
-    
     my $proc = run 'zef', 'info', $identity, :out, :err;
     my @deps;
 
     for $proc.out.lines -> $line {
-        # Match lines like "Depends: Module::A, Module::B"
-        # Also match "Build-depends: ..." and "Test-depends: ..."
         if $line ~~ /^(Depends || 'Build-depends' || 'Test-depends') \: \s+ (.*)/ {
             my $list-str = ~$0; 
-            
-            # Split comma-separated list
             for $list-str.split(',') -> $raw-dep {
                 my $clean = $raw-dep.trim;
-                
-                # Cleanup: "Module::Name:ver<...>" -> "Module::Name"
-                # We strip version/auth because our graph is node-to-node based on Name.
-                if $clean ~~ /^ (\S+) \s+ / { $clean = ~$0 } # Remove trailing comments like (optional)
-                if $clean ~~ /^ ([^:]+) /   { $clean = ~$0 } # Remove :ver/... suffix
-                
-                # Filter out empty or self
+                if $clean ~~ /^ (\S+) \s+ / { $clean = ~$0 } 
+                if $clean ~~ /^ ([^:]+) /   { $clean = ~$0 } 
                 next if $clean eq '';
                 @deps.push($clean);
             }
@@ -199,23 +203,18 @@ sub get-deep-dependencies($identity) {
 }
 
 # ==========================================
-# TOPOLOGICAL SORT (Kahn's Algorithm)
+# TOPOLOGICAL SORT
 # ==========================================
 
 sub topological-sort(%data) {
     my %graph;      
     my %in-degree;  
     
-    # 1. Initialize In-Degree 0 for all known modules
     for %data.keys -> $k { %in-degree{$k} = 0; }
 
-    # 2. Build Graph from dependencies
     for %data.kv -> $dependent, $info {
         my @deps = $info<deps>.list;
-        
         for @deps -> $dep-name {
-            # Only add edges if the dependency is actually in our scrapped list.
-            # (Ignores core modules like 'Test' or 'nqp' if they aren't in the list)
             if %data{$dep-name}:exists {
                 %graph{$dep-name}.push($dependent);
                 %in-degree{$dependent}++;
@@ -223,12 +222,10 @@ sub topological-sort(%data) {
         }
     }
 
-    # 3. Queue of 0-dependency items (The "Roots")
-    #    Sorting alphabetically ensures deterministic output for the base layer.
+    # Sort alphabetically to ensure deterministic "Base Layer"
     my @queue = %in-degree.keys.grep({ %in-degree{$_} == 0 }).sort;
     my @result;
 
-    # 4. Process
     while @queue {
         my $node = @queue.shift;
         @result.push($node);
@@ -240,17 +237,14 @@ sub topological-sort(%data) {
                     @queue.push($neighbor);
                 }
             }
-            # Re-sort queue to maintain deterministic order at every tier
             @queue = @queue.sort; 
         }
     }
 
-    # 5. Cycle Detection
     if @result.elems < %data.elems {
         my %seen = @result.map({ $_ => 1 });
         my @cyclic = %data.keys.grep({ !%seen{$_} }).sort;
-        note "WARNING: Cyclic dependencies detected in { @cyclic.elems } modules.";
-        note "  (Appending cycles to the end of the build list)";
+        note "WARNING: Cyclic dependencies detected in { @cyclic.elems } modules. Appending.";
         @result.append(@cyclic);
     }
 
@@ -260,8 +254,6 @@ sub topological-sort(%data) {
 sub update-build-order($r-handle, @list) {
     $r-handle.ensure-connection();
     $r-handle.client.del($KEY-BUILD-ORDER);
-    
-    # Push in batches to be network-friendly
     for @list.batch(100) -> @chunk {
         $r-handle.client.rpush($KEY-BUILD-ORDER, @chunk);
     }
