@@ -83,33 +83,74 @@ sub MAIN() {
 
 sub load-valkey-state($redis) {
     my %db;
-    
-    # 1. Get all known module names from the RSE Index
-    # FIX: Explicitly decode Buf -> Str
-    my @keys = $redis.smembers($KEY-INDEX).map({ $_ ~~ Buf ?? $_.decode('utf-8') !! $_ });
-    
-    return %() unless @keys;
+    say "  - Loading index via /usr/bin/valkey-cli (Quoted Mode)...";
 
-    # 2. Construct full keys
-    # Now safe because @keys are guaranteed Str
-    my @redis-keys = @keys.map: { $KEY-MOD-PREFIX ~ $_ };
-    
-    # 3. MGET (Multi-Get)
-    # FIX: Decode the JSON blobs returned by MGET
-    my @json-blobs = $redis.mget(@redis-keys).map({ $_ ~~ Buf ?? $_.decode('utf-8') !! $_ });
+    # 1. Fetch keys (Raw is fine for keys as they are simple strings)
+    my $proc-keys = run '/usr/bin/valkey-cli', 
+                        '-h', $VALKEY-HOST, 
+                        '-p', $VALKEY-PORT.Str, 
+                        '--raw', 
+                        'SMEMBERS', $KEY-INDEX, 
+                        :out, :err;
 
-    # 4. Reconstruct Hash
-    for @keys Z @json-blobs -> ($name, $json) {
-        # Check if $json is valid (defined, is Str, not empty)
-        if $json.defined && $json ~~ Str && $json.chars > 1 {
-            try {
-                %db{$name} = from-json($json);
-                CATCH { 
-                    default { note "Warning: Corrupt/Invalid JSON for module '$name'. Skipping."; }
+    my @all-keys = $proc-keys.out.lines.grep(*.chars > 0);
+    return %() unless @all-keys;
+    
+    say "    Found { @all-keys.elems } keys. Fetching data...";
+
+    # 2. Batch Fetch
+    for @all-keys.batch(50) -> @batch-keys {
+        my @full-keys = @batch-keys.map: { $KEY-MOD-PREFIX ~ $_ };
+        
+        # We REMOVE '--raw' here. 
+        # Standard mode returns: 1) "{\"ver\":\"1.0\"...}"
+        # This escapes newlines/quotes, guaranteeing 1 line per item.
+        my $proc-data = run '/usr/bin/valkey-cli',
+                            '-h', $VALKEY-HOST,
+                            '-p', $VALKEY-PORT.Str,
+                            'MGET', |@full-keys,
+                            :out, :err;
+
+        my @lines = $proc-data.out.lines;
+        
+        # Filter lines to keep only the values (lines starting with row numbers)
+        # Output format:
+        # 1) "value"
+        # 2) "value"
+        # (nil)
+        my @values;
+        for @lines -> $line {
+            # Match standard Redis CLI output: 1) "..."
+            if $line ~~ /^ \d+ \) \s+ \" (.*) \" $/ {
+                my $content = ~$0;
+                # Unescape CLI escaping: \" -> ", \\ -> \
+                $content = $content.subst('\"', '"', :g).subst('\\\\', '\\', :g);
+                @values.push($content);
+            }
+            elsif $line.contains('(nil)') {
+                @values.push(Nil);
+            }
+            # Ignore unrelated lines
+        }
+
+        # 3. Synchronize Keys with Parsed Values
+        # If counts don't match, we skip the batch to avoid corruption
+        if @values.elems == @batch-keys.elems {
+            for @batch-keys Z @values -> ($name, $json-str) {
+                next unless $json-str.defined;
+                
+                try {
+                    my $data = from-json($json-str);
+                    # CRITICAL: Ensure we actually got a Hash back
+                    if $data ~~ Hash {
+                        %db{$name} = $data;
+                    }
                 }
             }
         }
+        print ".";
     }
+    say ""; 
     return %db;
 }
 
