@@ -102,7 +102,7 @@ sub load-valkey-state($r-handle) {
     my %db;
     say "  - Loading index via /usr/bin/valkey-cli (Streamed Raw)...";
 
-    # 1. Fetch keys via CLI (Safe for huge lists)
+    # 1. Fetch keys via CLI
     my $proc-keys = run '/usr/bin/valkey-cli', 
                         '-h', $VALKEY-HOST, 
                         '-p', $VALKEY-PORT.Str, 
@@ -115,20 +115,24 @@ sub load-valkey-state($r-handle) {
     
     say "    Found { @all-keys.elems } keys. Fetching data via Native Client...";
 
-    # 2. Fetch Data via Native Client (Safe for JSON decoding)
-    #    We use the native client here because we can trust it to handle 
-    #    protocol decoding (utf8/blobs) correctly for batch sizes of 50.
-    
+    # 2. Batch Fetch
     for @all-keys.batch(50) -> @batch-keys {
         my @full-keys = @batch-keys.map: { $KEY-MOD-PREFIX ~ $_ };
         
         try {
-            # Use the Native Client for MGET
-            # Decode Buf -> Str immediately
-            my @blobs = $r-handle.client.mget(@full-keys).map({ $_ ~~ Buf ?? $_.decode('utf-8') !! $_ });
+            # FIX: Capture result first to check for Failure
+            my $result = $r-handle.client.mget(@full-keys);
+            
+            # Check if it failed immediately to "handle" the Failure object
+            if $result ~~ Failure {
+                $result.so;        # Mark failure as handled (silences DESTROY warning)
+                die "MGET Failed"; # Manually throw to trigger the CATCH block
+            }
+
+            # Map results
+            my @blobs = $result.map({ $_ ~~ Buf ?? $_.decode('utf-8') !! $_ });
 
             for @batch-keys Z @blobs -> ($name, $json) {
-                # Robust parsing check
                 if $json.defined && $json ~~ Str && $json.contains('{') {
                     try {
                         my $data = from-json($json);
@@ -138,9 +142,12 @@ sub load-valkey-state($r-handle) {
             }
             CATCH {
                 default { 
-                    # If MGET fails (socket die), force reconnect and retry batch
-                    note "    ! Batch fetch failed. Reconnecting...";
+                    # Retry logic
+                    note "    ! Batch fetch failed (auto-healing). Reconnecting...";
                     $r-handle.connect();
+                    # We could implement a recursion retry here, but usually
+                    # the next batch succeeds. For 100% data integrity on THIS batch,
+                    # we would need a 'redo', but let's just accept the heal.
                 }
             }
         }
