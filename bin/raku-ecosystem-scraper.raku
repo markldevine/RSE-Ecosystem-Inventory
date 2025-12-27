@@ -36,7 +36,10 @@ sub MAIN() {
     for %live-candidates.kv -> $name, $info {
         my $fresh-ver = $info<ver>;
         
-        if %artifact-db{$name}:exists {
+        # GUARD: Check existence AND type (Must be Hash)
+        if %artifact-db{$name}:exists && %artifact-db{$name} ~~ Hash {
+            
+            # Safe to access keys now
             my $cached-ver = Version.new(%artifact-db{$name}<ver>);
 
             if $fresh-ver > $cached-ver {
@@ -44,11 +47,12 @@ sub MAIN() {
                 @work-queue.push($info);
             }
             else {
-                # Cache Hit: Use Valkey data
+                # Cache Hit
                 %final-dataset{$name} = %artifact-db{$name};
             }
         }
         else {
+            # New or Corrupt Cache -> Treat as New
             say "  [NEW]    $name";
             @work-queue.push($info);
         }
