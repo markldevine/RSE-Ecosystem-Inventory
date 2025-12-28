@@ -1,7 +1,5 @@
 #!/var/lib/data/raku/maxzef/bin/raku
 
-#!/usr/bin/env raku
-
 use v6.d;
 use JSON::Fast;
 use Redis;
@@ -20,15 +18,11 @@ class RedisHandle {
     has $.host;
     has $.port;
     has $.client is rw;
-
-    method connect() {
-        say "  >> Establishing Redis connection...";
-        $!client = Redis.new("$!host:$!port");
+    method connect() { 
+        say "  >> [Redis] Establishing connection to $!host:$!port ...";
+        $!client = Redis.new("$!host:$!port"); 
     }
-
-    method ensure-connection() {
-        unless $!client { self.connect(); }
-    }
+    method ensure-connection() { unless $!client { self.connect(); } }
 }
 
 sub MAIN() {
@@ -36,52 +30,53 @@ sub MAIN() {
     $r-handle.connect();
 
     # 1. Fetch Fresh Universe
+    say "=== Phase 1: Discovery ===";
     say "Fetching fresh module list (Priority: Fez > CPAN > Rea)...";
     my %live-candidates = fetch-latest-candidates();
-    say "Found { %live-candidates.elems } unique winning candidates.";
+    my $total = %live-candidates.elems;
+    say "Found $total unique winning candidates.";
 
-    # 2. Process Queue with RESUME Logic
-    say "Beginning Deep Dependency Scan (Checkpoint Enabled)...";
+    # 2. Sequential Deep Scan
+    say "\n=== Phase 2: Precision Scanning (zef depends) ===";
+    say "Mode: Sequential, Resumable, Precise.";
     
     my @queue = %live-candidates.values.sort(*<name>);
     my %final-dataset; 
 
-    # Pass the total count for better logging
-    process-queue(@queue, %final-dataset, $r-handle);
+    process-queue-sequential(@queue, %final-dataset, $r-handle);
 
     say "-" x 40;
-    say "Scan Complete. Total Modules: { %final-dataset.elems }";
+    say "Scan Complete. Total Modules Verified: { %final-dataset.elems }";
 
-    # 3. Topological Sort
-    say "Starting Topological Sort...";
+    # 3. Garbage Collection
+    say "\n=== Phase 3: Storage Cleanup ===";
+    scrub-orphaned-keys($r-handle, %final-dataset);
+
+    # 4. Topological Sort
+    say "\n=== Phase 4: Build Order Calculation ===";
     my @sorted-names = topological-sort(%final-dataset);
     
-    # 4. Map back to Identities
+    # 5. Map back to Full Identities
     my @build-list;
     for @sorted-names -> $name {
         if %final-dataset{$name} -> $info {
-            my $id = $name;
-            if $info<ver>  { $id ~= ":ver<$info<ver>>" }
-            if $info<auth> { $id ~= ":auth<$info<auth>>" }
-            @build-list.push($id);
+            @build-list.push($info<identity>);
         }
     }
 
     say "Top 5 Install Candidates: { @build-list[0..4].join(', ') }";
-
-    # 5. Publish
-    say "Publishing pinned build order to Valkey list: $KEY-BUILD-ORDER";
+    say "Publishing build order to Valkey list: $KEY-BUILD-ORDER";
     update-build-order($r-handle, @build-list);
     
-    say "Done.";
+    say "\n=== SUCCESS ===";
     try { $r-handle.client.quit; }
 }
 
 # ==========================================
-# PROCESSING LOGIC (RESUME ENABLED)
+# PHASE 2: SEQUENTIAL PROCESSING
 # ==========================================
 
-sub process-queue(@queue, %current-set, $r-handle) {
+sub process-queue-sequential(@queue, %current-set, $r-handle) {
     my $total = @queue.elems;
     my $count = 0;
     my $skipped = 0;
@@ -90,64 +85,75 @@ sub process-queue(@queue, %current-set, $r-handle) {
         $count++;
         my $name = $candidate<name>;
         my $key  = $KEY-MOD-PREFIX ~ $name;
-
-        # ---------------------------------------------------------
-        # CHECKPOINT STRATEGY:
-        # Check if we already did the work for this EXACT version.
-        # ---------------------------------------------------------
-        my $cached-json = try { $r-handle.client.get($key) };
         
+        # --- CHECKPOINT START ---
+        my $cached-json = try { $r-handle.client.get($key) };
+        my $use-cache = False;
+
         if $cached-json {
             my $data = from-json($cached-json);
             
-            # Verify it matches the version we want
-            if $data<ver> eq $candidate<ver>.Str {
-                # CACHE HIT: Load into memory and skip 'zef info'
+            # Validation: Version/Auth match + presence of 'deps'
+            if $data<ver> eq $candidate<ver>.Str && ($data<auth> // '') eq ($candidate<auth> // '') {
                 %current-set{$name} = $data;
                 $skipped++;
+                $use-cache = True;
                 
-                # Log occasionally to show fast-forward progress
-                if $count %% 200 {
-                    say "[$count/$total] Skipped (Already in DB): $name";
+                if $count %% 100 { 
+                    say "[$count/$total] Skipped (Cache Hit): $name"; 
                 }
-                next; 
             }
         }
+        # --- CHECKPOINT END ---
 
-        # CACHE MISS: We must work.
-        # Identity needed for 'zef info'
-        my $identity = "$name";
-        if $candidate<ver>  { $identity ~= ":ver<$candidate<ver>>" }
-        if $candidate<auth> { $identity ~= ":auth<$candidate<auth>>" }
+        if !$use-cache {
+            # WORK: Run the Solver
+            say "[$count/$total] Resolving: $name ({$candidate<identity>}) ...";
+            
+            my @deps = run-zef-depends($candidate<identity>);
+            
+            my $record = {
+                name     => $name,
+                ver      => $candidate<ver>.Str,
+                auth     => $candidate<auth>,
+                api      => $candidate<api>,
+                repo     => $candidate<repo>,
+                identity => $candidate<identity>,
+                deps     => @deps,
+                scanned_at => DateTime.now.posix
+            };
 
-        # Log active scanning more frequently so we know it's alive
-        say "[$count/$total] Scanning: $name" if $count %% 10;
-
-        # DEEP SCAN
-        my @deps = get-deep-dependencies($identity);
-        
-        my $record = {
-            ver  => $candidate<ver>.Str,
-            auth => $candidate<auth>,
-            repo => $candidate<repo>,
-            deps => @deps
-        };
-
-        # Update Memory & Persist
-        %current-set{$name} = $record;
-        save-module-robust($r-handle, $name, $record);
-        
-        # Explicitly trigger garbage collection occasionally to help the OOM killer stay away
-        if $count %% 100 { full-gc; }
+            %current-set{$name} = $record;
+            save-module-robust($r-handle, $name, $record);
+            
+            # Small throttle to be kind to the OS process table
+            sleep 0.05; 
+        }
     }
-    
-    say "  >> Fast-forwarded $skipped modules. Scanned { $total - $skipped } new.";
+    say "  >> Resume Summary: Fast-forwarded $skipped. Resolved { $total - $skipped } fresh.";
+}
+
+# Precision Solver Wrapper
+sub run-zef-depends($identity) {
+    my $proc = run 'zef', 'depends', $identity, :out, :err;
+    my @deps;
+
+    for $proc.out.lines -> $line {
+        my $clean = $line.trim;
+        next if $clean.contains($identity);
+
+        if $clean ~~ /^ ([^:]+) / {
+            my $dep-name = ~$0;
+            next if $dep-name eq 'Rakudo' || $dep-name eq 'nqp' || $dep-name eq 'MoarVM';
+            @deps.push($dep-name);
+        }
+    }
+    return @deps.unique;
 }
 
 sub save-module-robust($r-handle, $name, %data) {
-    my $max-retries = 3;
+    my $max-retries = 5;
     my $attempt = 0;
-    
     while $attempt < $max-retries {
         try {
             $r-handle.ensure-connection();
@@ -158,36 +164,73 @@ sub save-module-robust($r-handle, $name, %data) {
         CATCH {
             default {
                 $attempt++;
-                note "    ! Connection issue saving $name. Retry $attempt..." if $attempt > 1;
+                note "    ! [DB Error] Saving $name. Retry $attempt/$max-retries..." if $attempt > 1;
                 try { $r-handle.client.quit; }
                 $r-handle.connect(); 
-                sleep 1;
+                sleep 2; 
             }
         }
     }
-    note "CRITICAL: Failed to save $name after $max-retries attempts.";
+    note "CRITICAL: Could not save $name to Valkey. Data may be inconsistent.";
 }
 
 # ==========================================
-# ZEF & SORTING (Unchanged)
+# PHASE 3: CLEANUP
+# ==========================================
+
+sub scrub-orphaned-keys($r-handle, %valid-modules) {
+    say "  >> Scanning Valkey for orphaned keys...";
+    # Flattened to single line to prevent quoting syntax errors
+    my $proc = run '/usr/bin/valkey-cli', '-h', $VALKEY-HOST, '--raw', '--scan', '--pattern', $KEY-MOD-PREFIX ~ '*', :out;
+    
+    my @db-keys = $proc.out.lines;
+    my $deleted = 0;
+
+    for @db-keys -> $db-key {
+        if $db-key ~~ /^ $KEY-MOD-PREFIX (.*) $/ {
+            my $name = ~$0;
+            unless %valid-modules{$name}:exists {
+                $r-handle.ensure-connection();
+                $r-handle.client.del($db-key);
+                $r-handle.client.srem($KEY-INDEX, $name);
+                $deleted++;
+                if $deleted %% 50 { print "x"; }
+            }
+        }
+    }
+    say "";
+    say "  >> Scrub complete. Deleted $deleted orphaned records.";
+}
+
+# ==========================================
+# DISCOVERY & SORTING
 # ==========================================
 
 sub fetch-latest-candidates() {
     my @repos = <fez cpan rea>;
     my %modules; 
-
     for @repos -> $repo {
         say "  - Querying $repo...";
         my $proc = run 'zef', 'list', $repo, :out, :err;
         for $proc.out.lines -> $line {
-            if $line ~~ /^ (\S+) \:ver\< (.*?) \> [ \:auth\< (.*?) \> ]? / {
+            # Regex for Name:ver<...>:auth<...>:api<...>
+            if $line ~~ /^ (\S+) \:ver\< (.*?) \> [ \:auth\< (.*?) \> ]? [ \:api\< (.*?) \> ]? / {
                 my $name = ~$0;
                 my $ver-str = ~$1;
                 my $auth = $2 // '';
+                my $api  = $3 // '';
                 my $ver = Version.new($ver-str);
                 
+                # FIXED: Explicit variable delimiting in string
+                my $id = "{$name}:ver<{$ver-str}>";
+                if $auth { $id ~= ":auth<{$auth}>" }
+                if $api  { $id ~= ":api<{$api}>" }
+
                 if %modules{$name}:!exists || $ver > %modules{$name}<ver> {
-                    %modules{$name} = { name => $name, ver => $ver, auth => ~$auth, repo => $repo };
+                    %modules{$name} = { 
+                        name => $name, ver => $ver, auth => ~$auth, api => ~$api,
+                        repo => $repo, identity => $id
+                    };
                 }
             }
         }
@@ -195,29 +238,12 @@ sub fetch-latest-candidates() {
     return %modules;
 }
 
-sub get-deep-dependencies($identity) {
-    my $proc = run 'zef', 'info', $identity, :out, :err;
-    my @deps;
-
-    for $proc.out.lines -> $line {
-        if $line ~~ /^(Depends || 'Build-depends' || 'Test-depends') \: \s+ (.*)/ {
-            my $list-str = ~$0; 
-            for $list-str.split(',') -> $raw-dep {
-                my $clean = $raw-dep.trim;
-                if $clean ~~ /^ (\S+) \s+ / { $clean = ~$0 } 
-                if $clean ~~ /^ ([^:]+) /   { $clean = ~$0 } 
-                next if $clean eq '';
-                @deps.push($clean);
-            }
-        }
-    }
-    return @deps.unique;
-}
-
 sub topological-sort(%data) {
     my %graph;      
     my %in-degree;  
     for %data.keys -> $k { %in-degree{$k} = 0; }
+
+    # Build Graph
     for %data.kv -> $dependent, $info {
         for $info<deps>.list -> $dep-name {
             if %data{$dep-name}:exists {
@@ -226,8 +252,10 @@ sub topological-sort(%data) {
             }
         }
     }
+
     my @queue = %in-degree.keys.grep({ %in-degree{$_} == 0 }).sort;
     my @result;
+
     while @queue {
         my $node = @queue.shift;
         @result.push($node);
@@ -239,6 +267,7 @@ sub topological-sort(%data) {
             @queue = @queue.sort; 
         }
     }
+
     if @result.elems < %data.elems {
         my %seen = @result.map({ $_ => 1 });
         my @cyclic = %data.keys.grep({ !%seen{$_} }).sort;
